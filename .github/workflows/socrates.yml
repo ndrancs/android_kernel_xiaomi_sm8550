@@ -1,0 +1,285 @@
+name: Compiling the Socrates kernel (SM8550) kernel version (kernel only + KernelSU + USBIP)
+
+on:
+  push:
+    branches:
+      - dev/*
+      - stable/*
+  workflow_dispatch:
+
+env:
+  AOSP_TOOLCHAIN_BRANCH: android16
+  AOSP_CLANG_VERSION: r547379
+  KERNELSU_VERSION: main
+
+jobs:
+  build:
+    name: Compile kernel
+    permissions: { contents: write }
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        device:
+          - socrates
+    steps:
+      - name: Install the software package
+        run: |
+          sudo apt update
+          sudo apt install -y ccache binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi libelf-dev libssl-dev flex bison build-essential device-tree-compiler
+
+      - name: Synchronize kernel source code
+        uses: actions/checkout@v4
+        with:
+          repository: LineageOS/android_kernel_xiaomi_sm8550
+          path: kernel
+          ref: lineage-23.2
+
+      - name: Synchronous device tree source code (for reference only)
+        uses: actions/checkout@v4
+        with:
+          repository: LineageOS/android_kernel_xiaomi_sm8550-devicetrees
+          path: device-trees
+          ref: lineage-23.2
+
+      - name: Cache Clang
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: clang
+          key: clang-${{ env.AOSP_TOOLCHAIN_BRANCH }}-${{ env.AOSP_CLANG_VERSION }}
+
+      - name: Download Clang
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p clang &&
+          curl -LSs "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/${{ env.AOSP_TOOLCHAIN_BRANCH }}-release/clang-${{ env.AOSP_CLANG_VERSION }}.tar.gz" |
+          tar xz -C clang
+
+      - name: aktifkan build ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: kernel-${{ matrix.device }}
+          restore-keys: kernel-${{ matrix.device }}
+          max-size: 5G
+
+      - name: Add KernelSU
+        working-directory: kernel
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s ${{ env.KERNELSU_VERSION }}
+
+      - name: Add KernelSU to GKI Config
+        working-directory: kernel
+        run: |
+          DEFCONFIG="arch/arm64/configs/socrates_GKI_defconfig"
+          echo "CONFIG_MODULES=y" >> $DEFCONFIG
+          echo "CONFIG_KPROBES=y" >> $DEFCONFIG
+          echo "CONFIG_OVERLAY_FS=y" >> $DEFCONFIG
+          sed -i 's/CONFIG_LTO=y/CONFIG_LTO=n/' $DEFCONFIG
+          sed -i 's/CONFIG_LTO_CLANG=y/CONFIG_LTO_CLANG=n/' $DEFCONFIG
+          echo "CONFIG_LTO_NONE=y" >> $DEFCONFIG
+          echo "CONFIG_CC_WERROR=n" >> $DEFCONFIG
+          echo "CONFIG_KSU=y" >> $DEFCONFIG
+          echo "CONFIG_USBIP_CORE=m" >> $DEFCONFIG
+          echo "CONFIG_USBIP_VHCI_HCD=m" >> $DEFCONFIG
+          echo "CONFIG_USBIP_HOST=m" >> $DEFCONFIG
+          echo "CONFIG_OF=y" >> $DEFCONFIG
+          echo "CONFIG_OF_OVERLAY=y" >> $DEFCONFIG
+          echo "CONFIG_ARCH_QCOM=y" >> $DEFCONFIG
+          echo "CONFIG_BUILD_ARM64_DT_OVERLAY=y" >> $DEFCONFIG
+          echo "# CONFIG_KASAN is not set" >> $DEFCONFIG
+          sed -i '/CONFIG_DEBUG_INFO_BTF/d' $DEFCONFIG
+          echo "# CONFIG_DEBUG_INFO_BTF is not set" >> $DEFCONFIG
+
+      - name: Configure LXC and Docker support
+        working-directory: kernel
+        run: |
+          DEFCONFIG="arch/arm64/configs/socrates_GKI_defconfig"
+          rm -rf utils
+          git clone https://github.com/tomxi1997/lxc-docker-support-for-android.git utils
+          sed -i '/select CFS_BANDWIDTH/d' utils/Kconfig
+          sed -i '/select DOCKER_STATISTICS/d' utils/Kconfig
+          sed -i '/select BLK_DEV_THROTTLING/d' utils/Kconfig
+          sed -i '/select CFQ_GROUP_IOSCHED/d' utils/Kconfig
+          echo 'source "utils/Kconfig"' >> "Kconfig"
+          echo "CONFIG_DOCKER=y" >> $DEFCONFIG
+          echo "# CONFIG_CFS_BANDWIDTH is not set" >> $DEFCONFIG
+          echo "# CONFIG_DOCKER_STATISTICS is not set" >> $DEFCONFIG
+          sed -i '/CONFIG_ANDROID_PARANOID_NETWORK/d' $DEFCONFIG
+          echo "# CONFIG_ANDROID_PARANOID_NETWORK is not set" >> $DEFCONFIG
+          echo "# CONFIG_BLK_DEV_THROTTLING is not set" >> $DEFCONFIG
+          echo "# CONFIG_CFQ_GROUP_IOSCHED is not set" >> $DEFCONFIG
+          chmod +x utils/runcpatch.sh
+          if [ -f kernel/cgroup/cgroup.c ]; then
+              sh utils/runcpatch.sh kernel/cgroup/cgroup.c
+          fi
+          if [ -f net/netfilter/xt_qtaguid.c ]; then
+              patch -p0 < utils/xt_qtaguid.patch
+          fi
+
+      - name: Repair configuration (disable virtualization, etc.)
+        working-directory: kernel
+        run: |
+          DEFCONFIG="arch/arm64/configs/socrates_GKI_defconfig"
+          sed -i '/CONFIG_KVM/d' $DEFCONFIG
+          echo "# CONFIG_KVM is not set" >> $DEFCONFIG
+          sed -i '/CONFIG_VIRTUALIZATION/d' $DEFCONFIG
+          echo "# CONFIG_VIRTUALIZATION is not set" >> $DEFCONFIG
+          sed -i '/CONFIG_VFIO/d' $DEFCONFIG
+          echo "# CONFIG_VFIO is not set" >> $DEFCONFIG
+          echo "CONFIG_MMU_NOTIFIER=y" >> $DEFCONFIG
+          echo "CONFIG_ANDROID_VENDOR_HOOKS=y" >> $DEFCONFIG
+          echo "CONFIG_TRACEPOINTS=y" >> $DEFCONFIG
+
+      - name: Compile Kernel
+        working-directory: kernel
+        run: |
+          export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
+          export KBUILD_BUILD_USER=${{ github.repository_owner }}
+          export KBUILD_BUILD_HOST=github-runner
+          make -j$(nproc) \
+            CC="ccache clang" \
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            O=out \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            socrates_GKI_defconfig all
+
+      - name: Compiling the USBIP module using Docker
+        run: |
+          cat > Dockerfile <<'EOF'
+          FROM ubuntu:22.04
+          RUN apt update && apt install -y \
+              build-essential bc bison flex libssl-dev libelf-dev \
+              git cpio kmod wget xz-utils \
+              gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          WORKDIR /build
+          EOF
+
+          docker build -t usbip-builder .
+
+          cat > build_usbip.sh <<'EOF'
+          #!/bin/bash
+          set -e
+          KERNEL_SRC="$1"
+          KERNEL_OUT="$2"
+          OUTPUT_DIR="$3"
+
+          cd "$KERNEL_SRC"
+          make O="$KERNEL_OUT" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- scripts_basic
+          make O="$KERNEL_OUT" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_prepare
+          make O="$KERNEL_OUT" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- M=drivers/usb/usbip modules
+
+          mkdir -p "$OUTPUT_DIR"
+          cp "$KERNEL_OUT"/drivers/usb/usbip/*.ko "$OUTPUT_DIR"
+          EOF
+          chmod +x build_usbip.sh
+
+          docker run --rm \
+            -v $GITHUB_WORKSPACE/kernel:/build/kernel \
+            -v $GITHUB_WORKSPACE/kernel/out:/build/kernel_out \
+            -v $GITHUB_WORKSPACE/modules_usbip:/out \
+            -v $GITHUB_WORKSPACE/build_usbip.sh:/build_usbip.sh \
+            usbip-builder /bin/bash /build_usbip.sh /build/kernel /build/kernel_out /out
+
+      - name: Package USBIP module
+        run: |
+          mkdir -p modules_final
+          cp modules_usbip/*.ko modules_final/ 2>/dev/null || true
+          cd modules_final && zip -qr ../modules-${{ matrix.device }}.zip *
+
+      - name: Prepare kernel image
+        working-directory: kernel
+        run: |
+          gzip -c out/arch/arm64/boot/Image > out/arch/arm64/boot/Image.gz
+          cp out/arch/arm64/boot/Image.gz out/arch/arm64/boot/Image.gz-dtb
+
+      - name: AnyKernel3
+        run: |
+          git clone https://github.com/osm0sis/AnyKernel3 --depth=1 ak3
+          cp kernel/out/arch/arm64/boot/Image.gz-dtb ak3/
+          cd ak3
+          cat >anykernel.sh <<EOF
+          properties() { '
+          kernel.string=Kernel for ${{ matrix.device }}
+          device.name1=${{ matrix.device }}
+          do.devicecheck=1
+          '; }
+          ramdisk_compression=auto
+          patch_vbmeta_flag=auto
+          is_slot_device=auto
+          block=auto
+          . tools/ak3-core.sh
+          split_boot
+          flash_boot
+          EOF
+          zip -qr9 ${{ matrix.device }}-${{ env.AOSP_TOOLCHAIN_BRANCH }}-Anykernel3.zip *
+
+      - name: boot.img
+        run: |
+          git clone https://android.googlesource.com/platform/system/tools/mkbootimg --depth=1 mkbootimg
+          cp kernel/out/arch/arm64/boot/Image.gz-dtb mkbootimg/
+          cd mkbootimg
+          boot_url=$(curl -LSs https://download.lineageos.org/api/v2/devices/${{ matrix.device }}/builds | jq -r '.[0].files[1].url')
+          curl -LSs $boot_url -o boot.img
+          mkbootimg_args=$(./unpack_bootimg.py --out out --boot_img boot.img --format mkbootimg)
+          mv Image.gz-dtb out/kernel
+          eval "./mkbootimg.py $mkbootimg_args -o ${{ matrix.device }}-${{ env.AOSP_TOOLCHAIN_BRANCH }}-boot-lineage.img"
+
+      - name: Pack and Upload AnyKernel3
+        uses: actions/upload-artifact@v5
+        with:
+          name: kernel-${{ matrix.device }}-ak3
+          path: ak3/${{ matrix.device }}-${{ env.AOSP_TOOLCHAIN_BRANCH }}-Anykernel3.zip
+
+      - name: Upload boot.img
+        uses: actions/upload-artifact@v5
+        with:
+          name: kernel-${{ matrix.device }}-boot
+          path: mkbootimg/${{ matrix.device }}-${{ env.AOSP_TOOLCHAIN_BRANCH }}-boot-lineage.img
+
+      - name: Upload USBIP module
+        uses: actions/upload-artifact@v5
+        with:
+          name: kernel-${{ matrix.device }}-usbip
+          path: modules-${{ matrix.device }}.zip
+
+  release:
+    name: release
+    permissions: { contents: write }
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Obtain build artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: kernel
+          pattern: kernel-*
+          merge-multiple: true
+
+      - name: Acquisition Time
+        id: time
+        run: |
+          echo "time=$(TZ='Asia/Jakarta' date -u +'%Y%m%d%H%M')" >> $GITHUB_OUTPUT
+          echo "timestamp=$(date +%s)" >> $GITHUB_OUTPUT
+
+      - name: Download KernelSU Manager
+        continue-on-error: true
+        uses: dawidd6/action-download-artifact@v11
+        with:
+          repo: rsuntk/KernelSU
+          workflow_conclusion: success
+          name: manager
+          workflow: build-manager.yml
+          path: manager
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: rel-${{ steps.time.outputs.timestamp }}
+          name: Kernel build ${{ steps.time.outputs.time }}
+          prerelease: ${{ startsWith(github.ref_name, 'dev/') }}
+          files: |
+            kernel/*
+            manager/*
